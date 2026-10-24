@@ -1,36 +1,57 @@
 /**
  * src/modules/evidenceReaders/sqlReader.js
  *
- * Parse SQLite-compatible SQL snapshot files.
- * Loads the SQL into an in-memory SQLite DB, then queries for records
- * associated with any of the user's identifiers.
+ * Pure JavaScript SQLite snapshot parser.
+ * Reads SQL dumps without native binary dependencies (safe across WSL/Linux/macOS/Windows).
  */
 
-import Database from 'better-sqlite3';
 import { readFileSync } from 'fs';
 import path from 'path';
 import { DATASET_DIR } from '../../data/loader.js';
 
-const _dbCache = new Map();
+const _cache = new Map();
 
-function getDb(filePath) {
-  if (_dbCache.has(filePath)) return _dbCache.get(filePath);
+/** Parse SQL row values, respecting quoted strings with commas and escaped quotes */
+function parseSqlValues(valStr) {
+  const values = [];
+  let cur = '';
+  let inQuotes = false;
+  let quoteChar = '';
 
-  const sql = readFileSync(filePath, 'utf8');
-  const db = new Database(':memory:');
+  for (let i = 0; i < valStr.length; i++) {
+    const ch = valStr[i];
 
-  db.pragma('journal_mode = WAL');
-  try {
-    db.exec(sql);
-  } catch {
-    const statements = sql.split(';').map(s => s.trim()).filter(s => s.length > 0);
-    for (const stmt of statements) {
-      try { db.exec(stmt + ';'); } catch {}
+    if (inQuotes) {
+      if (ch === quoteChar) {
+        if (valStr[i + 1] === quoteChar) {
+          cur += quoteChar;
+          i++; // skip escaped quote
+        } else {
+          inQuotes = false;
+        }
+      } else {
+        cur += ch;
+      }
+    } else {
+      if (ch === "'" || ch === '"') {
+        inQuotes = true;
+        quoteChar = ch;
+      } else if (ch === ',') {
+        values.push(cleanVal(cur));
+        cur = '';
+      } else {
+        cur += ch;
+      }
     }
   }
+  values.push(cleanVal(cur));
+  return values;
+}
 
-  _dbCache.set(filePath, db);
-  return db;
+function cleanVal(v) {
+  const trimmed = v.trim();
+  if (trimmed.toUpperCase() === 'NULL') return null;
+  return trimmed;
 }
 
 function inferCategoryFromRid(rid, tableName) {
@@ -50,79 +71,109 @@ function inferCategoryFromRid(rid, tableName) {
   return { systemId: 'account_service', dataCategory: 'USER_PROFILE' };
 }
 
+/** Check if a line string mentions any user identifier */
+function lineMatchesCtx(line, ctx) {
+  const lower = line.toLowerCase();
+  if (lower.includes(ctx.userId.toLowerCase())) return true;
+  for (const email of ctx.allEmails) {
+    if (lower.includes(email.toLowerCase())) return true;
+  }
+  for (const hash of ctx.emailHashes) {
+    if (lower.includes(hash.toLowerCase())) return true;
+  }
+  for (const phone of ctx.allPhones) {
+    const norm = phone.replace(/[\s\-\(\)]/g, '');
+    if (norm.length > 6 && lower.replace(/[\s\-\(\)]/g, '').includes(norm.toLowerCase())) return true;
+  }
+  return false;
+}
+
 export function extractFromSQL(evidenceFilePath, fileId, ctx, auditAt) {
   const absPath = path.join(DATASET_DIR, evidenceFilePath);
   const records = [];
 
-  let db;
-  try {
-    db = getDb(absPath);
-  } catch (e) {
-    console.warn(`[sqlReader] Failed to load ${evidenceFilePath}: ${e.message}`);
-    return records;
+  let sqlContent;
+  if (_cache.has(absPath)) {
+    sqlContent = _cache.get(absPath);
+  } else {
+    try {
+      sqlContent = readFileSync(absPath, 'utf8');
+      _cache.set(absPath, sqlContent);
+    } catch (e) {
+      console.warn(`[sqlReader] Failed to load ${evidenceFilePath}: ${e.message}`);
+      return records;
+    }
   }
 
-  const tables = db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all();
-
-  for (const { name: tableName } of tables) {
-    let rows;
-    try {
-      rows = db.prepare(`SELECT * FROM "${tableName}"`).all();
-    } catch {
-      continue;
-    }
-
-    for (const row of rows) {
-      const resourceId = row.resource_id || row.id;
-      if (!resourceId) continue;
-
-      // Check matching identity
-      let matches = false;
-      if (row.subject_reference === ctx.userId) matches = true;
-      if (row.customer_reference === ctx.userId) matches = true;
-      if (row.user_id === ctx.userId) matches = true;
-
-      const emailVal = row.email || row.owner_email || row.customer_email || row.requester_email;
-      if (emailVal && ctx.allEmails.has(emailVal.toLowerCase().trim())) matches = true;
-
-      const phoneVal = row.phone || row.owner_phone || row.requester_phone;
-      if (phoneVal && ctx.allPhones.has(phoneVal.trim())) matches = true;
-
-      if (row.email_hash && ctx.emailHashes.has(row.email_hash)) matches = true;
-
-      if (!matches) continue;
-
-      const { systemId, dataCategory } = inferCategoryFromRid(resourceId, tableName);
-      let state = 'PRESENT';
-
-      if (dataCategory === 'BACKUP_ARCHIVE') {
-        const allowed = row.restore_allowed === 1 || row.restore_allowed === '1' || row.restore_allowed === true;
-        state = allowed ? 'ACTIVE' : 'BLOCKED';
-      } else if (dataCategory === 'ACTIVE_DATA_FLOW') {
-        const enabled = row.enabled === 1 || row.enabled === '1' || row.enabled === true;
-        state = enabled ? 'ACTIVE' : 'DISABLED';
-      } else if (dataCategory === 'ANALYTICS_PROFILE') {
-        const hasPii = row.email || row.phone || row.email_hash;
-        state = hasPii ? 'PRESENT' : 'ANONYMIZED';
-      } else if (dataCategory === 'ACCOUNT_TOMBSTONE') {
-        const hasPii = row.full_name || row.email || row.phone || row.email_hash;
-        state = hasPii ? 'PRESENT' : 'REDACTED';
-      } else if (row.account_status === 'DELETED') {
-        state = 'ABSENT';
-      } else if (tableName.includes('replica') && row.account_status === 'ACTIVE') {
-        state = 'PRESENT';
+  // 1. Extract table column definitions
+  const tableColumns = new Map();
+  const createTableRegex = /CREATE\s+TABLE(?:\s+IF\s+NOT\s+EXISTS)?\s+["']?([a-zA-Z0-9_]+)["']?\s*\(([\s\S]*?)\);/gi;
+  let match;
+  while ((match = createTableRegex.exec(sqlContent)) !== null) {
+    const tableName = match[1];
+    const colDefStr = match[2];
+    const cols = [];
+    const lines = colDefStr.split(',');
+    for (const colLine of lines) {
+      const colNameMatch = colLine.trim().match(/^["']?([a-zA-Z0-9_]+)["']?\s+/);
+      if (colNameMatch && !['CHECK', 'PRIMARY', 'FOREIGN', 'UNIQUE', 'CONSTRAINT'].includes(colNameMatch[1].toUpperCase())) {
+        cols.push(colNameMatch[1].toLowerCase());
       }
-
-      records.push({
-        resourceId,
-        systemId,
-        dataCategory,
-        state,
-        evidenceId: fileId,
-        identifyingFields: {},
-        sourceTable: tableName,
-      });
     }
+    tableColumns.set(tableName, cols);
+  }
+
+  // 2. Parse INSERT statements
+  const insertRegex = /INSERT\s+INTO\s+["']?([a-zA-Z0-9_]+)["']?(?:\s*\(([^)]+)\))?\s+VALUES\s*\(([\s\S]*?)\);/gi;
+  while ((match = insertRegex.exec(sqlContent)) !== null) {
+    const tableName = match[1];
+    const valStr = match[3];
+
+    // Quick filter: check if line mentions user identifiers
+    if (!lineMatchesCtx(match[0], ctx)) continue;
+
+    const cols = tableColumns.get(tableName) || [];
+    const vals = parseSqlValues(valStr);
+
+    const row = {};
+    for (let i = 0; i < vals.length; i++) {
+      const colName = cols[i] || `col_${i}`;
+      row[colName] = vals[i];
+    }
+
+    const resourceId = row.resource_id || row.id || vals[0];
+    if (!resourceId) continue;
+
+    const { systemId, dataCategory } = inferCategoryFromRid(resourceId, tableName);
+    let state = 'PRESENT';
+
+    if (dataCategory === 'BACKUP_ARCHIVE') {
+      const allowed = row.restore_allowed === 1 || row.restore_allowed === '1' || row.restore_allowed === true;
+      state = allowed ? 'ACTIVE' : 'BLOCKED';
+    } else if (dataCategory === 'ACTIVE_DATA_FLOW') {
+      const enabled = row.enabled === 1 || row.enabled === '1' || row.enabled === true;
+      state = enabled ? 'ACTIVE' : 'DISABLED';
+    } else if (dataCategory === 'ANALYTICS_PROFILE') {
+      const hasPii = row.email || row.phone || row.email_hash;
+      state = hasPii ? 'PRESENT' : 'ANONYMIZED';
+    } else if (dataCategory === 'ACCOUNT_TOMBSTONE') {
+      const hasPii = row.full_name || row.email || row.phone || row.email_hash;
+      state = hasPii ? 'PRESENT' : 'REDACTED';
+    } else if (row.account_status === 'DELETED') {
+      state = 'ABSENT';
+    } else if (tableName.includes('replica') && row.account_status === 'ACTIVE') {
+      state = 'PRESENT';
+    }
+
+    records.push({
+      resourceId,
+      systemId,
+      dataCategory,
+      state,
+      evidenceId: fileId,
+      identifyingFields: {},
+      sourceTable: tableName,
+    });
   }
 
   return records;

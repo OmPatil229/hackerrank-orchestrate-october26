@@ -73,7 +73,8 @@ class NvidiaClient {
     if (data.usage) {
       recordUsage(data.usage.prompt_tokens, data.usage.completion_tokens, model);
     }
-    return data.choices?.[0]?.message?.content || '';
+    const msg = data.choices?.[0]?.message;
+    return msg?.content || msg?.reasoning_content || '';
   }
 
   async classify(prompt) {
