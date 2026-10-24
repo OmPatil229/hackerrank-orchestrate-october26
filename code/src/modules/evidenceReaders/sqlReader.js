@@ -1,17 +1,51 @@
 /**
  * src/modules/evidenceReaders/sqlReader.js
  *
- * Pure JavaScript SQLite snapshot parser.
- * Reads SQL dumps without native binary dependencies (safe across WSL/Linux/macOS/Windows).
+ * Fast line-by-line SQLite snapshot parser without regex backtracking.
  */
 
 import { readFileSync } from 'fs';
 import path from 'path';
 import { DATASET_DIR } from '../../data/loader.js';
 
-const _cache = new Map();
+// Cache: absPath -> { lines: string[], tableColumns: Map<string, string[]> }
+const _fileCache = new Map();
 
-/** Parse SQL row values, respecting quoted strings with commas and escaped quotes */
+function getCachedSqlFile(absPath) {
+  if (_fileCache.has(absPath)) return _fileCache.get(absPath);
+
+  let content;
+  try {
+    content = readFileSync(absPath, 'utf8');
+  } catch (e) {
+    console.warn(`[sqlReader] Failed to read ${absPath}: ${e.message}`);
+    return null;
+  }
+
+  const lines = content.split('\n');
+  const tableColumns = new Map();
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (trimmed.startsWith('CREATE TABLE')) {
+      const nameMatch = trimmed.match(/CREATE\s+TABLE(?:\s+IF\s+NOT\s+EXISTS)?\s+["']?([a-zA-Z0-9_]+)["']?\s*\((.*)\)/i);
+      if (nameMatch) {
+        const tblName = nameMatch[1];
+        const colDef = nameMatch[2];
+        const cols = colDef.split(',').map(c => {
+          const m = c.trim().match(/^["']?([a-zA-Z0-9_]+)["']?/);
+          return m ? m[1].toLowerCase() : null;
+        }).filter(c => c && !['check', 'primary', 'foreign', 'unique', 'constraint'].includes(c));
+        tableColumns.set(tblName, cols);
+      }
+    }
+  }
+
+  const cached = { lines, tableColumns };
+  _fileCache.set(absPath, cached);
+  return cached;
+}
+
 function parseSqlValues(valStr) {
   const values = [];
   let cur = '';
@@ -20,12 +54,11 @@ function parseSqlValues(valStr) {
 
   for (let i = 0; i < valStr.length; i++) {
     const ch = valStr[i];
-
     if (inQuotes) {
       if (ch === quoteChar) {
         if (valStr[i + 1] === quoteChar) {
           cur += quoteChar;
-          i++; // skip escaped quote
+          i++;
         } else {
           inQuotes = false;
         }
@@ -71,7 +104,6 @@ function inferCategoryFromRid(rid, tableName) {
   return { systemId: 'account_service', dataCategory: 'USER_PROFILE' };
 }
 
-/** Check if a line string mentions any user identifier */
 function lineMatchesCtx(line, ctx) {
   const lower = line.toLowerCase();
   if (lower.includes(ctx.userId.toLowerCase())) return true;
@@ -82,8 +114,8 @@ function lineMatchesCtx(line, ctx) {
     if (lower.includes(hash.toLowerCase())) return true;
   }
   for (const phone of ctx.allPhones) {
-    const norm = phone.replace(/[\s\-\(\)]/g, '');
-    if (norm.length > 6 && lower.replace(/[\s\-\(\)]/g, '').includes(norm.toLowerCase())) return true;
+    const norm = phone.replace(/[\s\-\(\)\+]/g, '');
+    if (norm.length > 6 && lower.replace(/[\s\-\(\)\+]/g, '').includes(norm.toLowerCase())) return true;
   }
   return false;
 }
@@ -92,45 +124,22 @@ export function extractFromSQL(evidenceFilePath, fileId, ctx, auditAt) {
   const absPath = path.join(DATASET_DIR, evidenceFilePath);
   const records = [];
 
-  let sqlContent;
-  if (_cache.has(absPath)) {
-    sqlContent = _cache.get(absPath);
-  } else {
-    try {
-      sqlContent = readFileSync(absPath, 'utf8');
-      _cache.set(absPath, sqlContent);
-    } catch (e) {
-      console.warn(`[sqlReader] Failed to load ${evidenceFilePath}: ${e.message}`);
-      return records;
-    }
-  }
+  const cached = getCachedSqlFile(absPath);
+  if (!cached) return records;
 
-  // 1. Extract table column definitions
-  const tableColumns = new Map();
-  const createTableRegex = /CREATE\s+TABLE(?:\s+IF\s+NOT\s+EXISTS)?\s+["']?([a-zA-Z0-9_]+)["']?\s*\(([\s\S]*?)\);/gi;
-  let match;
-  while ((match = createTableRegex.exec(sqlContent)) !== null) {
+  const { lines, tableColumns } = cached;
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith('INSERT INTO')) continue;
+    if (!lineMatchesCtx(trimmed, ctx)) continue;
+
+    // Parse: INSERT INTO [table] VALUES(...)
+    const match = trimmed.match(/INSERT\s+INTO\s+["']?([a-zA-Z0-9_]+)["']?(?:\s*\([^)]+\))?\s+VALUES\s*\(([\s\S]*)\);?/i);
+    if (!match) continue;
+
     const tableName = match[1];
-    const colDefStr = match[2];
-    const cols = [];
-    const lines = colDefStr.split(',');
-    for (const colLine of lines) {
-      const colNameMatch = colLine.trim().match(/^["']?([a-zA-Z0-9_]+)["']?\s+/);
-      if (colNameMatch && !['CHECK', 'PRIMARY', 'FOREIGN', 'UNIQUE', 'CONSTRAINT'].includes(colNameMatch[1].toUpperCase())) {
-        cols.push(colNameMatch[1].toLowerCase());
-      }
-    }
-    tableColumns.set(tableName, cols);
-  }
-
-  // 2. Parse INSERT statements
-  const insertRegex = /INSERT\s+INTO\s+["']?([a-zA-Z0-9_]+)["']?(?:\s*\(([^)]+)\))?\s+VALUES\s*\(([\s\S]*?)\);/gi;
-  while ((match = insertRegex.exec(sqlContent)) !== null) {
-    const tableName = match[1];
-    const valStr = match[3];
-
-    // Quick filter: check if line mentions user identifiers
-    if (!lineMatchesCtx(match[0], ctx)) continue;
+    const valStr = match[2];
 
     const cols = tableColumns.get(tableName) || [];
     const vals = parseSqlValues(valStr);
