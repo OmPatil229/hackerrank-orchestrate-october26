@@ -55,7 +55,7 @@ async function processCase(caseItem, store) {
   }
 
   // 2. Identity resolution
-  const ctx = resolveIdentity(email, store, auditAt);
+  const ctx = resolveIdentity(email, auditAt, store);
   if (!ctx) {
     return {
       caseId,
