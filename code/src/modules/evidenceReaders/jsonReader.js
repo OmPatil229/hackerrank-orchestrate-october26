@@ -9,7 +9,6 @@ import { readFileSync } from 'fs';
 import path from 'path';
 import { DATASET_DIR } from '../../data/loader.js';
 
-// Cache: filePath -> parsed JSON
 const _cache = new Map();
 
 function loadJSON(filePath) {
@@ -19,118 +18,6 @@ function loadJSON(filePath) {
   return data;
 }
 
-/** Infer system_id and data_category from field names and resource_id prefix */
-function inferSystemInfo(dataStore, collection, resourceId) {
-  const ds = (dataStore || '').toLowerCase();
-  const col = (collection || '').toLowerCase();
-  const rid = (resourceId || '').toLowerCase();
-
-  if (ds.includes('account_service') || col.includes('customer_profile')) {
-    return { systemId: 'account_service', dataCategory: 'USER_PROFILE' };
-  }
-  if (ds.includes('search_service') || col.includes('search')) {
-    return { systemId: 'search_service', dataCategory: 'SEARCH_INDEX_ENTRY' };
-  }
-  if (ds.includes('analytics') || col.includes('analytics')) {
-    return { systemId: 'analytics_platform', dataCategory: 'ANALYTICS_PROFILE' };
-  }
-  if (ds.includes('support') || col.includes('support')) {
-    return { systemId: 'support_platform', dataCategory: 'SUPPORT_MESSAGE' };
-  }
-  if (ds.includes('export') || col.includes('export')) {
-    return { systemId: 'export_service', dataCategory: 'USER_EXPORT' };
-  }
-  if (ds.includes('marketing') || col.includes('marketing')) {
-    return { systemId: 'marketing_platform', dataCategory: 'MARKETING_PROFILE' };
-  }
-  if (ds.includes('backup') || col.includes('backup')) {
-    return { systemId: 'backup_service', dataCategory: 'BACKUP_ARCHIVE' };
-  }
-  if (ds.includes('security') || col.includes('security_audit')) {
-    return { systemId: 'security_service', dataCategory: 'SECURITY_AUDIT_LOG' };
-  }
-  if (ds.includes('identity') || col.includes('deleted_customer')) {
-    return { systemId: 'identity_service', dataCategory: 'ACCOUNT_TOMBSTONE' };
-  }
-  if (ds.includes('integration') || col.includes('connector') || col.includes('data_flow')) {
-    return { systemId: 'integration_service', dataCategory: 'ACTIVE_DATA_FLOW' };
-  }
-
-  // Fallback from resource_id prefix
-  if (rid.startsWith('account_')) return { systemId: 'account_service', dataCategory: 'USER_PROFILE' };
-  if (rid.startsWith('search_')) return { systemId: 'search_service', dataCategory: 'SEARCH_INDEX_ENTRY' };
-  if (rid.startsWith('analytics_')) return { systemId: 'analytics_platform', dataCategory: 'ANALYTICS_PROFILE' };
-  if (rid.startsWith('support_')) return { systemId: 'support_platform', dataCategory: 'SUPPORT_MESSAGE' };
-  if (rid.startsWith('export_')) return { systemId: 'export_service', dataCategory: 'USER_EXPORT' };
-  if (rid.startsWith('backup_')) return { systemId: 'backup_service', dataCategory: 'BACKUP_ARCHIVE' };
-  if (rid.startsWith('tombstone_')) return { systemId: 'identity_service', dataCategory: 'ACCOUNT_TOMBSTONE' };
-  if (rid.startsWith('audit_record_')) return { systemId: 'security_service', dataCategory: 'SECURITY_AUDIT_LOG' };
-  if (rid.startsWith('data_flow_')) return { systemId: 'integration_service', dataCategory: 'ACTIVE_DATA_FLOW' };
-
-  return { systemId: 'account_service', dataCategory: 'USER_PROFILE' };
-}
-
-/** Check if a record object matches the user's identity context */
-function recordMatchesCtx(rec, ctx) {
-  if (!rec || typeof rec !== 'object') return false;
-  if (rec.customer_reference === ctx.userId) return true;
-  if (rec.user_id === ctx.userId) return true;
-  if (rec.subject_reference === ctx.userId) return true;
-  if (rec.email && ctx.allEmails.has(rec.email.toLowerCase())) return true;
-  if (rec.email_hash && ctx.emailHashes.has(rec.email_hash)) return true;
-  if (rec.phone && ctx.allPhones.has(rec.phone.trim())) return true;
-  // Support document: search for email in nested document field
-  if (rec.document) {
-    const doc = rec.document;
-    if (doc.email && ctx.allEmails.has(doc.email.toLowerCase())) return true;
-    if (doc.email_hash && ctx.emailHashes.has(doc.email_hash)) return true;
-    if (doc.customer_reference === ctx.userId) return true;
-  }
-  return false;
-}
-
-/** Determine state of a record */
-function determineState(rec, dataCategory) {
-  if (!rec) return 'PRESENT';
-
-  // Tombstone check
-  if (dataCategory === 'ACCOUNT_TOMBSTONE') {
-    const hasAnyPii = rec.name || rec.email || rec.phone || rec.email_hash;
-    return hasAnyPii ? 'PRESENT' : 'REDACTED';
-  }
-
-  // Analytics: if user_id is null and no personal info → anonymized
-  if (dataCategory === 'ANALYTICS_PROFILE') {
-    if (rec.user_id === null && !rec.email && !rec.phone) return 'ANONYMIZED';
-  }
-
-  // Support: check if PII fields redacted
-  if (dataCategory === 'SUPPORT_MESSAGE') {
-    const hasExposedPii = rec.customer_email || rec.customer_name || rec.customer_phone;
-    if (!hasExposedPii && rec.status === 'REDACTED') return 'REDACTED';
-  }
-
-  // Integration / data flow: check if active
-  if (dataCategory === 'ACTIVE_DATA_FLOW') {
-    if (rec.status === 'ACTIVE' || rec.enabled === true) return 'ACTIVE';
-    if (rec.status === 'DISABLED' || rec.enabled === false) return 'DISABLED';
-  }
-
-  if (rec.account_status === 'DELETED') return 'ABSENT';
-  return 'PRESENT';
-}
-
-/**
- * Extract user records from a JSON evidence file.
- *
- * Handles:
- * - customer_data_snapshot_bundle: {snapshots: [{data_store, collection, records[]}]}
- * - service_resource_export: {resources: [{resource_id, ...}]}
- * - customer_export_manifest: {exports: [...]}
- * - security_audit_ledger: {entries: [...]}
- * - connector_configurations: {connectors: [...]}
- * - customer_analytics_report: {records: [...]}
- */
 export function extractFromJSON(evidenceFilePath, fileId, ctx, auditAt) {
   const absPath = path.join(DATASET_DIR, evidenceFilePath);
   const records = [];
@@ -143,74 +30,285 @@ export function extractFromJSON(evidenceFilePath, fileId, ctx, auditAt) {
     return records;
   }
 
-  // --- customer_data_snapshot_bundle ---
+  // --- 1. service_exports (e.g. service_resource_export_*.json, evidence_92) ---
+  if (data.service_exports && typeof data.service_exports === 'object') {
+    const se = data.service_exports;
+
+    // account_service
+    if (se.account_service?.profile_lookups) {
+      for (const item of se.account_service.profile_lookups) {
+        const prof = item.profile;
+        const matches = prof && (
+          (prof.email && ctx.allEmails.has(prof.email.toLowerCase())) ||
+          (prof.customer_reference && prof.customer_reference === ctx.userId) ||
+          (prof.phone && ctx.allPhones.has(prof.phone.trim())) ||
+          (prof.email_hash && ctx.emailHashes.has(prof.email_hash))
+        );
+        if (matches) {
+          records.push({
+            resourceId: item.resource_id,
+            systemId: 'account_service',
+            dataCategory: 'USER_PROFILE',
+            state: item.status_code === 404 ? 'ABSENT' : 'PRESENT',
+            evidenceId: fileId,
+            identifyingFields: prof || {}
+          });
+        }
+      }
+    }
+
+    // analytics_platform
+    if (se.analytics_platform?.profiles) {
+      for (const item of se.analytics_platform.profiles) {
+        const matches = (
+          (item.email && ctx.allEmails.has(item.email.toLowerCase())) ||
+          (item.customer_reference && item.customer_reference === ctx.userId) ||
+          (item.phone && ctx.allPhones.has(item.phone.trim())) ||
+          (item.email_hash && ctx.emailHashes.has(item.email_hash))
+        );
+        if (matches) {
+          const hasPii = item.email || item.phone || item.email_hash;
+          records.push({
+            resourceId: item.resource_id,
+            systemId: 'analytics_platform',
+            dataCategory: 'ANALYTICS_PROFILE',
+            state: hasPii ? 'PRESENT' : 'ANONYMIZED',
+            evidenceId: fileId,
+            identifyingFields: {}
+          });
+        }
+      }
+    }
+
+    // backup_service
+    if (se.backup_service?.restore_entries) {
+      for (const item of se.backup_service.restore_entries) {
+        const matches = (
+          (item.customer_email && ctx.allEmails.has(item.customer_email.toLowerCase())) ||
+          (item.customer_reference && item.customer_reference === ctx.userId)
+        );
+        if (matches) {
+          records.push({
+            resourceId: item.resource_id,
+            systemId: 'backup_service',
+            dataCategory: 'BACKUP_ARCHIVE',
+            state: item.restore_allowed ? 'ACTIVE' : 'BLOCKED',
+            evidenceId: fileId,
+            identifyingFields: {}
+          });
+        }
+      }
+    }
+
+    // export_service
+    if (se.export_service?.exports) {
+      for (const item of se.export_service.exports) {
+        const matches = (
+          (item.owner_email && ctx.allEmails.has(item.owner_email.toLowerCase())) ||
+          (item.customer_reference && item.customer_reference === ctx.userId) ||
+          (item.owner_phone && ctx.allPhones.has(item.owner_phone.trim()))
+        );
+        if (matches) {
+          records.push({
+            resourceId: item.resource_id,
+            systemId: 'export_service',
+            dataCategory: 'USER_EXPORT',
+            state: 'PRESENT',
+            evidenceId: fileId,
+            identifyingFields: {}
+          });
+        }
+      }
+    }
+
+    // integration_service
+    if (se.integration_service?.connectors) {
+      for (const item of se.integration_service.connectors) {
+        const matches = (
+          (item.customer_email && ctx.allEmails.has(item.customer_email.toLowerCase())) ||
+          (item.customer_reference && item.customer_reference === ctx.userId)
+        );
+        if (matches) {
+          records.push({
+            resourceId: item.resource_id,
+            systemId: 'integration_service',
+            dataCategory: 'ACTIVE_DATA_FLOW',
+            state: item.enabled ? 'ACTIVE' : 'DISABLED',
+            evidenceId: fileId,
+            identifyingFields: {}
+          });
+        }
+      }
+    }
+
+    // search_service
+    if (se.search_service?.index_queries) {
+      for (const item of se.search_service.index_queries) {
+        const docs = item.hits?.documents || [];
+        for (const doc of docs) {
+          const matches = (
+            (doc.email && ctx.allEmails.has(doc.email.toLowerCase())) ||
+            (doc.customer_reference && doc.customer_reference === ctx.userId) ||
+            (doc.phone && ctx.allPhones.has(doc.phone.trim())) ||
+            (doc.email_hash && ctx.emailHashes.has(doc.email_hash))
+          );
+          if (matches) {
+            records.push({
+              resourceId: doc.resource_id || item.resource_id,
+              systemId: 'search_service',
+              dataCategory: 'SEARCH_INDEX_ENTRY',
+              state: 'PRESENT',
+              evidenceId: fileId,
+              identifyingFields: {}
+            });
+          }
+        }
+      }
+    }
+
+    // security_service
+    if (se.security_service?.audit_records || se.security_service?.audit_events) {
+      const entries = se.security_service.audit_records || se.security_service.audit_events || [];
+      for (const item of entries) {
+        const matches = (item.subject_reference && item.subject_reference === ctx.userId);
+        if (matches) {
+          records.push({
+            resourceId: item.resource_id,
+            systemId: 'security_service',
+            dataCategory: 'SECURITY_AUDIT_LOG',
+            state: 'PRESENT',
+            evidenceId: fileId,
+            identifyingFields: {}
+          });
+        }
+      }
+    }
+
+    // support_platform
+    if (se.support_platform?.support_tickets || se.support_platform?.tickets) {
+      const tickets = se.support_platform.support_tickets || se.support_platform.tickets || [];
+      for (const item of tickets) {
+        const matches = (
+          (item.requester_email && ctx.allEmails.has(item.requester_email.toLowerCase())) ||
+          (item.customer_reference && item.customer_reference === ctx.userId) ||
+          (item.requester_phone && ctx.allPhones.has(item.requester_phone.trim()))
+        );
+        if (matches) {
+          const hasPii = item.requester_email || item.requester_phone;
+          records.push({
+            resourceId: item.resource_id,
+            systemId: 'support_platform',
+            dataCategory: item.resource_id?.startsWith('support_attachment_') ? 'SUPPORT_ATTACHMENT' : 'SUPPORT_MESSAGE',
+            state: (item.status === 'REDACTED' || !hasPii) ? 'REDACTED' : 'PRESENT',
+            evidenceId: fileId,
+            identifyingFields: {}
+          });
+        }
+      }
+    }
+  }
+
+  // --- 2. customer_data_snapshot_bundle ---
   if (data.snapshots && Array.isArray(data.snapshots)) {
     for (const snap of data.snapshots) {
       const capturedAt = snap.captured_at ? new Date(snap.captured_at) : null;
       if (capturedAt && capturedAt > auditAt) continue;
 
-      const dataStore = snap.data_store || '';
-      const collection = snap.collection || '';
+      const dataStore = (snap.data_store || '').toLowerCase();
+      const collection = (snap.collection || '').toLowerCase();
 
       for (const rec of (snap.records || [])) {
-        if (!recordMatchesCtx(rec, ctx)) continue;
+        const matches = (
+          rec.customer_reference === ctx.userId ||
+          rec.user_id === ctx.userId ||
+          rec.subject_reference === ctx.userId ||
+          (rec.email && ctx.allEmails.has(rec.email.toLowerCase())) ||
+          (rec.email_hash && ctx.emailHashes.has(rec.email_hash)) ||
+          (rec.phone && ctx.allPhones.has(rec.phone.trim()))
+        );
+        if (!matches) continue;
 
         const resourceId = rec.resource_id || rec.id;
         if (!resourceId) continue;
 
-        const { systemId, dataCategory } = inferSystemInfo(dataStore, collection, resourceId);
-        const state = determineState(rec, dataCategory);
+        let systemId = 'account_service';
+        let dataCategory = 'USER_PROFILE';
+        if (dataStore.includes('search') || collection.includes('search') || resourceId.startsWith('search_')) {
+          systemId = 'search_service';
+          dataCategory = 'SEARCH_INDEX_ENTRY';
+        } else if (dataStore.includes('analytics') || collection.includes('analytics') || resourceId.startsWith('analytics_')) {
+          systemId = 'analytics_platform';
+          dataCategory = 'ANALYTICS_PROFILE';
+        } else if (dataStore.includes('support') || collection.includes('support') || resourceId.startsWith('support_')) {
+          systemId = 'support_platform';
+          dataCategory = 'SUPPORT_MESSAGE';
+        } else if (dataStore.includes('export') || collection.includes('export') || resourceId.startsWith('export_')) {
+          systemId = 'export_service';
+          dataCategory = 'USER_EXPORT';
+        } else if (dataStore.includes('backup') || collection.includes('backup') || resourceId.startsWith('backup_')) {
+          systemId = 'backup_service';
+          dataCategory = 'BACKUP_ARCHIVE';
+        } else if (dataStore.includes('security') || collection.includes('security') || resourceId.startsWith('audit_record_')) {
+          systemId = 'security_service';
+          dataCategory = 'SECURITY_AUDIT_LOG';
+        } else if (dataStore.includes('identity') || collection.includes('deleted_customer') || resourceId.startsWith('tombstone_')) {
+          systemId = 'identity_service';
+          dataCategory = 'ACCOUNT_TOMBSTONE';
+        }
 
-        if (state === 'ABSENT') continue;
+        let state = 'PRESENT';
+        if (dataCategory === 'ACCOUNT_TOMBSTONE') {
+          const hasPii = rec.name || rec.email || rec.phone || rec.email_hash;
+          state = hasPii ? 'PRESENT' : 'REDACTED';
+        } else if (dataCategory === 'ANALYTICS_PROFILE') {
+          state = (rec.email || rec.phone) ? 'PRESENT' : 'ANONYMIZED';
+        } else if (rec.account_status === 'DELETED') {
+          state = 'ABSENT';
+        }
 
-        const identifyingFields = {};
-        if (rec.full_name) identifyingFields.full_name = rec.full_name;
-        if (rec.email) identifyingFields.email = rec.email;
-        if (rec.phone) identifyingFields.phone = rec.phone;
-        if (rec.name) identifyingFields.name = rec.name;
-        if (rec.email_hash) identifyingFields.email_hash = rec.email_hash;
-
-        // For ANONYMIZED / REDACTED: only include if still has PII
-        records.push({ resourceId, systemId, dataCategory, state, evidenceId: fileId, identifyingFields });
+        records.push({
+          resourceId, systemId, dataCategory, state, evidenceId: fileId,
+          identifyingFields: {}
+        });
       }
     }
   }
 
-  // --- service_resource_export ---
-  if (data.resources && Array.isArray(data.resources)) {
-    for (const res of data.resources) {
-      if (!recordMatchesCtx(res, ctx)) continue;
-      const resourceId = res.resource_id;
-      if (!resourceId) continue;
-
-      const { systemId, dataCategory } = inferSystemInfo(
-        res.origin_system || res.system || '',
-        res.collection || res.type || '',
-        resourceId
+  // --- 3. customer_analytics_report ---
+  if (data.records && Array.isArray(data.records) && data.collection?.includes('analytics')) {
+    for (const rec of data.records) {
+      const matches = (
+        (rec.email && ctx.allEmails.has(rec.email.toLowerCase())) ||
+        (rec.user_id && rec.user_id === ctx.userId) ||
+        (rec.phone && ctx.allPhones.has(rec.phone.trim())) ||
+        (rec.email_hash && ctx.emailHashes.has(rec.email_hash))
       );
-      const state = determineState(res, dataCategory);
-      if (state === 'ABSENT') continue;
-
+      if (!matches) continue;
+      const resourceId = rec.resource_id;
+      if (!resourceId) continue;
+      const hasPii = rec.email || rec.phone || rec.email_hash;
       records.push({
-        resourceId, systemId, dataCategory, state, evidenceId: fileId,
+        resourceId,
+        systemId: 'analytics_platform',
+        dataCategory: 'ANALYTICS_PROFILE',
+        state: hasPii ? 'PRESENT' : 'ANONYMIZED',
+        evidenceId: fileId,
         identifyingFields: {}
       });
     }
   }
 
-  // --- connector_configurations ---
+  // --- 4. connector_configurations ---
   if (data.connectors && Array.isArray(data.connectors)) {
     for (const conn of data.connectors) {
-      if (!recordMatchesCtx(conn, ctx)) {
-        // Also check by email in connection string or references
-        const connStr = JSON.stringify(conn).toLowerCase();
-        const hasRef = [...ctx.allEmails].some(e => connStr.includes(e)) ||
-          connStr.includes(ctx.userId.toLowerCase());
-        if (!hasRef) continue;
-      }
+      const connStr = JSON.stringify(conn).toLowerCase();
+      const matches = (
+        [...ctx.allEmails].some(e => connStr.includes(e)) ||
+        connStr.includes(ctx.userId.toLowerCase())
+      );
+      if (!matches) continue;
       const resourceId = conn.connector_id || conn.id || conn.resource_id;
       if (!resourceId) continue;
-
       const state = (conn.status === 'ACTIVE' || conn.enabled) ? 'ACTIVE' : 'DISABLED';
       records.push({
         resourceId,
@@ -223,28 +321,33 @@ export function extractFromJSON(evidenceFilePath, fileId, ctx, auditAt) {
     }
   }
 
-  // --- customer_export_jobs / export manifests ---
+  // --- 5. customer_export_jobs / export manifests ---
   if (data.exports && Array.isArray(data.exports)) {
     for (const exp of data.exports) {
-      if (!recordMatchesCtx(exp, ctx)) continue;
+      const matches = (
+        (exp.email && ctx.allEmails.has(exp.email.toLowerCase())) ||
+        (exp.customer_reference && exp.customer_reference === ctx.userId) ||
+        (exp.owner_email && ctx.allEmails.has(exp.owner_email.toLowerCase()))
+      );
+      if (!matches) continue;
       const resourceId = exp.export_id || exp.resource_id || exp.id;
       if (!resourceId) continue;
-      const state = exp.status === 'DELETED' ? 'ABSENT' : 'PRESENT';
-      if (state === 'ABSENT') continue;
       records.push({
-        resourceId, systemId: 'export_service', dataCategory: 'USER_EXPORT',
-        state: 'PRESENT', evidenceId: fileId, identifyingFields: {}
+        resourceId,
+        systemId: 'export_service',
+        dataCategory: 'USER_EXPORT',
+        state: exp.status === 'DELETED' ? 'ABSENT' : 'PRESENT',
+        evidenceId: fileId,
+        identifyingFields: {}
       });
     }
   }
 
-  // --- security_audit_ledger ---
+  // --- 6. security_audit_ledger ---
   if (data.entries && Array.isArray(data.entries)) {
     for (const entry of data.entries) {
-      if (!recordMatchesCtx(entry, ctx)) {
-        const ref = entry.subject_reference || entry.user_id || '';
-        if (ref !== ctx.userId) continue;
-      }
+      const ref = entry.subject_reference || entry.user_id || '';
+      if (ref !== ctx.userId) continue;
       const resourceId = entry.resource_id || entry.audit_id;
       if (!resourceId) continue;
       records.push({
@@ -254,21 +357,6 @@ export function extractFromJSON(evidenceFilePath, fileId, ctx, auditAt) {
         state: 'PRESENT',
         evidenceId: fileId,
         identifyingFields: {}
-      });
-    }
-  }
-
-  // --- customer_analytics_report ---
-  if (data.records && Array.isArray(data.records)) {
-    for (const rec of data.records) {
-      if (!recordMatchesCtx(rec, ctx)) continue;
-      const resourceId = rec.resource_id || rec.analytics_id;
-      if (!resourceId) continue;
-      const state = determineState(rec, 'ANALYTICS_PROFILE');
-      if (state === 'ABSENT') continue;
-      records.push({
-        resourceId, systemId: 'analytics_platform', dataCategory: 'ANALYTICS_PROFILE',
-        state, evidenceId: fileId, identifyingFields: {}
       });
     }
   }

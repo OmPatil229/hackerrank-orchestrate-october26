@@ -1,18 +1,17 @@
 /**
  * src/modules/evidenceReaders/logReader.js
  *
- * Parse log evidence files (structured JSON logs, syslog archives,
- * service event streams, resource lookup traces, notification delivery logs).
- *
- * Strategy: read line-by-line, grep for user identifiers, then extract
- * structured event data from JSON-formatted lines.
+ * Parse log evidence files:
+ *  1. Pipe-separated handover text (e.g. evidence_03)
+ *  2. Key-value service readback logs (e.g. resource_lookup_trace_*.log, evidence_94)
+ *  3. Structured JSON observability logs with trace_id correlation (e.g. evidence_06)
+ *  4. Syslog & generic text logs
  */
 
 import { readFileSync } from 'fs';
 import path from 'path';
 import { DATASET_DIR } from '../../data/loader.js';
 
-// Cache: filePath -> lines[]
 const _cache = new Map();
 
 function loadLines(filePath) {
@@ -23,26 +22,22 @@ function loadLines(filePath) {
   return lines;
 }
 
-/** Try to parse a line as JSON; return null if not JSON */
 function tryParseJSON(line) {
   const start = line.indexOf('{');
   if (start === -1) return null;
   try {
     return JSON.parse(line.slice(start));
   } catch {
-    // Try to find first valid JSON object substring
-    try {
-      const match = line.match(/\{.*\}/);
-      if (match) return JSON.parse(match[0]);
-    } catch {}
+    const match = line.match(/\{.*\}/);
+    if (match) {
+      try { return JSON.parse(match[0]); } catch {}
+    }
     return null;
   }
 }
 
-/** Check if a line string mentions any of the user's identifiers */
 function lineMatchesCtx(line, ctx) {
   const lower = line.toLowerCase();
-
   if (lower.includes(ctx.userId.toLowerCase())) return true;
   for (const email of ctx.allEmails) {
     if (lower.includes(email.toLowerCase())) return true;
@@ -51,78 +46,31 @@ function lineMatchesCtx(line, ctx) {
     if (lower.includes(hash.toLowerCase())) return true;
   }
   for (const phone of ctx.allPhones) {
-    // Normalise phone: remove spaces/dashes for matching
     const norm = phone.replace(/[\s\-\(\)]/g, '');
     if (norm.length > 6 && lower.replace(/[\s\-\(\)]/g, '').includes(norm.toLowerCase())) return true;
   }
   return false;
 }
 
-/** Infer resource category from resource_id or event fields */
-function inferResource(rec, line) {
-  const rid = (rec.resource_id || rec.resourceId || '').toLowerCase();
-  const evt = (rec.event_type || rec.eventType || rec.action || '').toLowerCase();
-  const src = (rec.source_system || rec.service || '').toLowerCase();
-
-  if (rid.startsWith('search_') || src.includes('search')) {
-    return { resourceId: rid || 'search_unknown', systemId: 'search_service', dataCategory: 'SEARCH_INDEX_ENTRY' };
-  }
-  if (rid.startsWith('analytics_') || src.includes('analytics')) {
-    return { resourceId: rid, systemId: 'analytics_platform', dataCategory: 'ANALYTICS_PROFILE' };
-  }
-  if (rid.startsWith('support_') || src.includes('support')) {
-    return { resourceId: rid, systemId: 'support_platform', dataCategory: 'SUPPORT_MESSAGE' };
-  }
-  if (rid.startsWith('export_') || src.includes('export')) {
-    return { resourceId: rid, systemId: 'export_service', dataCategory: 'USER_EXPORT' };
-  }
-  if (rid.startsWith('backup_') || src.includes('backup')) {
-    return { resourceId: rid, systemId: 'backup_service', dataCategory: 'BACKUP_ARCHIVE' };
-  }
-  if (rid.startsWith('audit_record_') || src.includes('security')) {
-    return { resourceId: rid, systemId: 'security_service', dataCategory: 'SECURITY_AUDIT_LOG' };
-  }
-  if (rid.startsWith('data_flow_') || src.includes('integration')) {
-    return { resourceId: rid, systemId: 'integration_service', dataCategory: 'ACTIVE_DATA_FLOW' };
-  }
-  if (rid.startsWith('account_') || src.includes('account')) {
-    return { resourceId: rid, systemId: 'account_service', dataCategory: 'USER_PROFILE' };
-  }
-  if (rid.startsWith('email_delivery_')) {
-    return { resourceId: rid, systemId: 'email_delivery_service', dataCategory: 'EMAIL_DELIVERY_LOG' };
-  }
-
-  // Fallback: extract resource_id from line if not in parsed JSON
-  const ridMatch = line.match(/\b(account|search|analytics|support|export|backup|audit_record|data_flow|tombstone|email_delivery)_\w+/i);
-  if (ridMatch) {
-    const prefix = ridMatch[1].toLowerCase();
-    const found = ridMatch[0];
-    const map = {
-      account: { systemId: 'account_service', dataCategory: 'USER_PROFILE' },
-      search: { systemId: 'search_service', dataCategory: 'SEARCH_INDEX_ENTRY' },
-      analytics: { systemId: 'analytics_platform', dataCategory: 'ANALYTICS_PROFILE' },
-      support: { systemId: 'support_platform', dataCategory: 'SUPPORT_MESSAGE' },
-      export: { systemId: 'export_service', dataCategory: 'USER_EXPORT' },
-      backup: { systemId: 'backup_service', dataCategory: 'BACKUP_ARCHIVE' },
-      audit_record: { systemId: 'security_service', dataCategory: 'SECURITY_AUDIT_LOG' },
-      data_flow: { systemId: 'integration_service', dataCategory: 'ACTIVE_DATA_FLOW' },
-      tombstone: { systemId: 'identity_service', dataCategory: 'ACCOUNT_TOMBSTONE' },
-      email_delivery: { systemId: 'email_delivery_service', dataCategory: 'EMAIL_DELIVERY_LOG' },
-    };
-    const info = map[prefix] || { systemId: 'account_service', dataCategory: 'USER_PROFILE' };
-    return { resourceId: found, ...info };
-  }
-
-  return null;
+function inferCategoryFromRid(rid) {
+  const r = (rid || '').toLowerCase();
+  if (r.startsWith('account_')) return { systemId: 'account_service', dataCategory: 'USER_PROFILE' };
+  if (r.startsWith('search_')) return { systemId: 'search_service', dataCategory: 'SEARCH_INDEX_ENTRY' };
+  if (r.startsWith('analytics_')) return { systemId: 'analytics_platform', dataCategory: 'ANALYTICS_PROFILE' };
+  if (r.startsWith('support_attachment_')) return { systemId: 'support_platform', dataCategory: 'SUPPORT_ATTACHMENT' };
+  if (r.startsWith('support_')) return { systemId: 'support_platform', dataCategory: 'SUPPORT_MESSAGE' };
+  if (r.startsWith('export_')) return { systemId: 'export_service', dataCategory: 'USER_EXPORT' };
+  if (r.startsWith('backup_')) return { systemId: 'backup_service', dataCategory: 'BACKUP_ARCHIVE' };
+  if (r.startsWith('audit_record_')) return { systemId: 'security_service', dataCategory: 'SECURITY_AUDIT_LOG' };
+  if (r.startsWith('data_flow_')) return { systemId: 'integration_service', dataCategory: 'ACTIVE_DATA_FLOW' };
+  if (r.startsWith('tombstone_')) return { systemId: 'identity_service', dataCategory: 'ACCOUNT_TOMBSTONE' };
+  if (r.startsWith('email_delivery_')) return { systemId: 'email_delivery_service', dataCategory: 'EMAIL_DELIVERY_LOG' };
+  return { systemId: 'account_service', dataCategory: 'USER_PROFILE' };
 }
 
-/**
- * Extract user-relevant events from a log evidence file.
- * Returns resource state entries.
- */
 export function extractFromLog(evidenceFilePath, fileId, ctx, auditAt) {
   const absPath = path.join(DATASET_DIR, evidenceFilePath);
-  const found = new Map(); // resourceId -> resourceState (latest wins)
+  const found = new Map();
 
   let lines;
   try {
@@ -132,33 +80,111 @@ export function extractFromLog(evidenceFilePath, fileId, ctx, auditAt) {
     return [];
   }
 
+  // --- Step 1: Handle pipe-separated handovers (e.g. evidence_03) ---
+  // Format: - 2026-10-01T12:00:00Z | system_id | resource_id | data_category | status | identifier
   for (const line of lines) {
-    if (!lineMatchesCtx(line, ctx)) continue;
+    if (line.includes('|') && lineMatchesCtx(line, ctx)) {
+      const parts = line.split('|').map(s => s.trim().replace(/^-\s*/, ''));
+      if (parts.length >= 6) {
+        const [, systemId, resourceId, dataCategory, status] = parts;
+        let state = 'PRESENT';
+        if (status === 'NOT_FOUND') state = 'ABSENT';
+        else if (status === 'ANONYMIZED') state = 'ANONYMIZED';
+        else if (status === 'REDACTED') state = 'REDACTED';
+        else if (status === 'ACTIVE') state = 'ACTIVE';
+        else if (status === 'DISABLED') state = 'DISABLED';
+        else if (status === 'BLOCKED') state = 'BLOCKED';
+        else if (status === 'FOUND' || status === 'IDENTIFIABLE') state = 'PRESENT';
 
-    const rec = tryParseJSON(line);
-    const resourceInfo = inferResource(rec || {}, line);
-    if (!resourceInfo || !resourceInfo.resourceId) continue;
-
-    const { resourceId, systemId, dataCategory } = resourceInfo;
-
-    // Determine state from event_type
-    const eventType = (rec?.event_type || rec?.action || '').toUpperCase();
-    let state = 'PRESENT';
-
-    if (['DELETE_RECORD', 'DELETED', 'ACCOUNT_DELETED'].includes(eventType)) state = 'ABSENT';
-    else if (['ANONYMIZE_RECORD', 'ANONYMIZED'].includes(eventType)) state = 'ANONYMIZED';
-    else if (['REDACT_RECORD', 'REDACTED'].includes(eventType)) state = 'REDACTED';
-    else if (['SYNC_RECORD', 'ACTIVE', 'ENABLED'].includes(eventType)) state = 'ACTIVE';
-    else if (['DISABLE_DATA_FLOW', 'DISABLED'].includes(eventType)) state = 'DISABLED';
-    else if (['BLOCK_RESTORE', 'BLOCKED'].includes(eventType)) state = 'BLOCKED';
-
-    // Only keep non-absent records (we report what's still there)
-    if (state !== 'ABSENT') {
-      const existing = found.get(resourceId);
-      if (!existing || existing.state === 'PRESENT') {
-        found.set(resourceId, { resourceId, systemId, dataCategory, state, evidenceId: fileId, identifyingFields: {} });
+        found.set(resourceId, {
+          resourceId, systemId, dataCategory, state, evidenceId: fileId, identifyingFields: {}
+        });
       }
     }
+  }
+
+  // --- Step 2: Handle structured JSON logs with trace_id correlation ---
+  const matchingTraceIds = new Set();
+  const eventsByTrace = new Map();
+
+  for (const line of lines) {
+    const json = tryParseJSON(line);
+    if (!json) continue;
+
+    const traceId = json.trace_id;
+    if (traceId) {
+      if (!eventsByTrace.has(traceId)) eventsByTrace.set(traceId, []);
+      eventsByTrace.get(traceId).push(json);
+
+      if (lineMatchesCtx(line, ctx)) {
+        matchingTraceIds.add(traceId);
+      }
+    }
+  }
+
+  for (const traceId of matchingTraceIds) {
+    const events = eventsByTrace.get(traceId) || [];
+    for (const evt of events) {
+      const rid = evt.resource_id;
+      if (!rid) continue;
+
+      const { systemId, dataCategory } = inferCategoryFromRid(rid);
+      let state = 'PRESENT';
+
+      if (evt.http_status === '404' || evt.rows === '0') {
+        state = 'ABSENT';
+      } else if (evt.rows === '1' || evt.http_status === '200') {
+        if (dataCategory === 'ANALYTICS_PROFILE') {
+          const hasPii = evt.email || evt.phone || evt.email_hash || evt.customer_reference;
+          state = hasPii ? 'PRESENT' : 'ANONYMIZED';
+        } else if (dataCategory === 'SUPPORT_MESSAGE') {
+          const hasPii = evt.requester_email || evt.requester_phone;
+          state = (evt.status === 'REDACTED' || !hasPii) ? 'REDACTED' : 'PRESENT';
+        } else {
+          state = 'PRESENT';
+        }
+      } else if (evt.restore_allowed !== undefined) {
+        state = evt.restore_allowed ? 'ACTIVE' : 'BLOCKED';
+      } else if (evt.enabled !== undefined) {
+        state = evt.enabled ? 'ACTIVE' : 'DISABLED';
+      }
+
+      found.set(rid, {
+        resourceId: rid, systemId, dataCategory, state, evidenceId: fileId, identifyingFields: {}
+      });
+    }
+  }
+
+  // --- Step 3: Key-value log line parsing (e.g. resource_lookup_trace_*.log) ---
+  for (const line of lines) {
+    if (!lineMatchesCtx(line, ctx)) continue;
+    if (line.includes('|')) continue; // already handled
+
+    const ridMatch = line.match(/\bresource_id=([a-zA-Z0-9_\-]+)/);
+    if (!ridMatch) continue;
+    const resourceId = ridMatch[1];
+    const { systemId, dataCategory } = inferCategoryFromRid(resourceId);
+
+    let state = 'PRESENT';
+    if (line.includes('http_status=404') || line.includes('rows=0')) {
+      state = 'ABSENT';
+    } else if (line.includes('customer_reference=null email=null phone=null')) {
+      state = 'ANONYMIZED';
+    } else if (line.includes('enabled=false') || line.includes('status=stopped')) {
+      state = 'DISABLED';
+    } else if (line.includes('enabled=true')) {
+      state = 'ACTIVE';
+    } else if (line.includes('restore_allowed=false') || line.includes('restore_allowed=0')) {
+      state = 'BLOCKED';
+    } else if (line.includes('restore_allowed=true') || line.includes('restore_allowed=1')) {
+      state = 'ACTIVE';
+    } else if (line.includes('status=REDACTED') || (line.includes('requester_name=null requester_email=null'))) {
+      state = 'REDACTED';
+    }
+
+    found.set(resourceId, {
+      resourceId, systemId, dataCategory, state, evidenceId: fileId, identifyingFields: {}
+    });
   }
 
   return Array.from(found.values());
